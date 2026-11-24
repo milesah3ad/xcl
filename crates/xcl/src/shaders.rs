@@ -390,7 +390,7 @@ impl RecompAgg {
         }
         // `XCL_RECOMP_WINDOWS=4`: as a title with unified memory translates (`pso::mem_windows`)
         let mem_windows = std::env::var("XCL_RECOMP_WINDOWS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
-        match recomp::translate(code, &recomp::Options { mode, wave64, mem_windows, ..Default::default() }) {
+        match recomp::translate_routed(code, &recomp::Options { mode, wave64, mem_windows, ..Default::default() }) {
             Ok(t) => {
                 let e = self.by_mode.entry(label.to_string()).or_default();
                 e.0 += 1;
@@ -929,7 +929,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         // `translate_mesh`)
                         let split = if matches!(mode, recomp::Mode::Vertex(_) | recomp::Mode::Pixel(_)) { graphics_split } else { split };
                         let opt = recomp::Options { mode: mode.clone(), wave64: recomp::detect_wave64(code), split_wave64: split, mem_windows: windows, ..Default::default() };
-                        let Ok(t) = recomp::translate(code, &opt) else { continue };
+                        let Ok(t) = recomp::translate_routed(code, &opt) else { continue };
                         if !t.complete() {
                             continue;
                         }
