@@ -4,9 +4,10 @@
 //! 3,281 buffer loads of a retail program become 3,281 copies of the format conversion. Here
 //! the program is cut into blocks (at the leaders, and around every instruction whose HLSL is
 //! long), each instruction is emitted by `emit::Em` exactly as in `translate`, with its
-//! temporaries numbered from t1, and blocks with the same text share one `case` of a
-//! dispatch loop. A branch goes to the block at an offset from its own (part of the text), so
-//! the table (`XCL_BT`) only gives every block, in address order, its case; falling through
+//! temporaries numbered from t1, and blocks with the same text and branch condition share one
+//! `case` of a dispatch loop. A branch goes to the block at an offset from its own: the offset
+//! most of a case's blocks jump by, and for the others the target by block index (`select`),
+//! so the table (`XCL_BT`) only gives every block, in address order, its case; falling through
 //! goes to the next block. The block index is the same in every lane (branch conditions are
 //! wave-uniform), as `pc` of the guarded block chain is, so the split-wave64 halves walk the
 //! same blocks.
@@ -25,7 +26,8 @@ const HEAVY: usize = 600;
 
 /// Largest table (32-bit words). A static array is constant data for the driver: on an
 /// RTX 5070 Ti, CreateComputePipelineState took 12,288 words and failed with E_OUTOFMEMORY
-/// at 15,360.
+/// at 15,360. A table the usual packing makes larger is packed across words; the program falls
+/// back to `translate` only when that is still larger.
 const MAX_TABLE_WORDS: usize = 8192;
 
 /// The compact form pays: at least `COMPACT_MIN_INSTRUCTIONS` instructions, and the distinct
@@ -76,7 +78,7 @@ pub fn compact_wanted(code: &[u8]) -> bool {
 /// is the number of distinct block texts). A program without branches gets `translate`'s
 /// straight-line form; geometry programs (ES → GS through s_setpc) are not supported.
 pub fn translate_compact(code: &[u8], opt: &Options) -> Result<Translation, String> {
-    compact(code, opt, HEAVY)
+    compact(code, opt, HEAVY, MAX_TABLE_WORDS)
 }
 
 /// One block in address order: its text, and the branch that ends it (condition, empty when
@@ -159,7 +161,9 @@ fn blocks(insts: &[rdna2::Decoded], leaders: &BTreeSet<u64>, em: &mut emit::Em, 
     Ok(out)
 }
 
-fn compact(code: &[u8], opt: &Options, heavy: usize) -> Result<Translation, String> {
+/// `translate_compact` with the bound `heavy` (`HEAVY`); a table of more than `dense_above`
+/// words is packed across words.
+pub(super) fn compact(code: &[u8], opt: &Options, heavy: usize, dense_above: usize) -> Result<Translation, String> {
     if matches!(opt.mode, Mode::Geometry(_)) {
         return Err("compact form: geometry programs are not supported".into());
     }
@@ -170,31 +174,74 @@ fn compact(code: &[u8], opt: &Options, heavy: usize) -> Result<Translation, Stri
     let list = blocks(&insts, &leaders, &mut em, heavy)?;
     let n = list.len();
     let at: HashMap<u64, usize> = list.iter().enumerate().map(|(k, b)| (b.pc, k)).collect();
-    // the distinct texts (with the address of the first block of each); each block's text
+    // the distinct texts (with the address of the first block of each), keyed on the code and
+    // the branch condition: the target is data, one per block of the text (`targets`)
     let mut texts: Vec<(String, u64)> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
+    let mut conds: Vec<Option<String>> = Vec::new();
+    let mut targets: Vec<Vec<(usize, usize)>> = Vec::new();
     let mut class = Vec::with_capacity(n);
     for (k, b) in list.into_iter().enumerate() {
-        let mut text = b.text;
-        if let Some((cond, t)) = b.branch {
-            let to = *at.get(&t).ok_or_else(|| format!("+{:#x}: branch to {t:#x}, which starts no block", b.pc))?;
-            let nb = if to >= k { format!("xcl_b + {}u", to - k) } else { format!("xcl_b - {}u", k - to) };
-            let _ = if cond.is_empty() { writeln!(text, "            xcl_nb = {nb};") } else { writeln!(text, "            if ({cond}) xcl_nb = {nb};") };
+        let mut key = b.text;
+        let mut to = None;
+        if let Some((cond, t)) = &b.branch {
+            to = Some(*at.get(t).ok_or_else(|| format!("+{:#x}: branch to {t:#x}, which starts no block", b.pc))?);
+            let _ = writeln!(key, "\u{1}{cond}");
         }
-        let c = match index.get(&text) {
+        let c = match index.get(&key) {
             Some(&c) => c,
             None => {
-                index.insert(text.clone(), texts.len());
-                texts.push((text, b.pc));
+                index.insert(key.clone(), texts.len());
+                conds.push(b.branch.map(|(cond, _)| cond));
+                targets.push(Vec::new());
+                texts.push((key, b.pc));
                 texts.len() - 1
             }
         };
+        if let Some(to) = to {
+            targets[c].push((k, to));
+        }
         class.push(c as u32);
     }
-    // the table: the blocks' cases, `per` to a word
+    // a text's branch: the offset most of its blocks jump by, and the target of each other
+    // block by its index (`select`, no branch: the index is wave-uniform)
+    for (c, (text, _)) in texts.iter_mut().enumerate() {
+        let Some(cond) = &conds[c] else { continue };
+        text.truncate(text.rfind('\u{1}').unwrap());
+        let mut count: HashMap<i64, usize> = HashMap::new();
+        for &(k, to) in &targets[c] {
+            *count.entry(to as i64 - k as i64).or_default() += 1;
+        }
+        let d = *count.iter().max_by_key(|&(d, n)| (*n, -d.abs(), *d)).unwrap().0;
+        let off = if d >= 0 { format!("xcl_b + {d}u") } else { format!("xcl_b - {}u", -d) };
+        let nb = if count.len() == 1 {
+            off
+        } else {
+            let _ = writeln!(text, "            uint xcl_t = {off};");
+            for &(k, to) in targets[c].iter().filter(|&&(k, to)| to as i64 - k as i64 != d) {
+                let _ = writeln!(text, "            xcl_t = select(xcl_b == {k}u, {to}u, xcl_t);");
+            }
+            "xcl_t".to_string()
+        };
+        let _ = if cond.is_empty() { writeln!(text, "            xcl_nb = {nb};") } else { writeln!(text, "            if ({cond}) xcl_nb = {nb};") };
+    }
+    // the table: the blocks' cases, `per` to a word; past `dense_above` words, packed across
+    // words (`bits` from bit `xcl_b * bits`; one word of padding for the second read)
     let bits = (usize::BITS - texts.len().saturating_sub(1).leading_zeros()).max(1);
     let per = (32 / bits) as usize;
-    let words: Vec<u32> = class.chunks(per).map(|c| c.iter().enumerate().fold(0u32, |w, (j, &v)| w | v << (j as u32 * bits))).collect();
+    let mut words: Vec<u32> = class.chunks(per).map(|c| c.iter().enumerate().fold(0u32, |w, (j, &v)| w | v << (j as u32 * bits))).collect();
+    let dense = words.len() > dense_above;
+    if dense {
+        words = vec![0u32; (n * bits as usize).div_ceil(32) + 1];
+        for (b, &v) in class.iter().enumerate() {
+            let p = b * bits as usize;
+            let (w, s) = (p / 32, (p % 32) as u32);
+            words[w] |= v << s;
+            if s + bits > 32 {
+                words[w + 1] |= v >> (32 - s);
+            }
+        }
+    }
     if words.len() > MAX_TABLE_WORDS {
         return Err(format!("compact form: {n} blocks of {} texts need a {}-word table (at most {MAX_TABLE_WORDS})", texts.len(), words.len()));
     }
@@ -206,7 +253,12 @@ fn compact(code: &[u8], opt: &Options, heavy: usize) -> Result<Translation, Stri
     }
     body.push_str("    };\n    uint xcl_b = 0u;\n    [loop] for (;;) {\n        uint xcl_nb = xcl_b + 1u;\n");
     let mask = (1u64 << bits) - 1;
-    let _ = writeln!(body, "        switch ((XCL_BT[xcl_b / {per}u] >> (xcl_b % {per}u * {bits}u)) & {mask:#x}u) {{");
+    if dense {
+        let _ = writeln!(body, "        uint xcl_p = xcl_b * {bits}u;");
+        let _ = writeln!(body, "        switch (((XCL_BT[xcl_p >> 5u] >> (xcl_p & 31u)) | ((XCL_BT[(xcl_p >> 5u) + 1u] << 1u) << (31u - (xcl_p & 31u)))) & {mask:#x}u) {{");
+    } else {
+        let _ = writeln!(body, "        switch ((XCL_BT[xcl_b / {per}u] >> (xcl_b % {per}u * {bits}u)) & {mask:#x}u) {{");
+    }
     for (k, (text, pc)) in texts.iter().enumerate() {
         let _ = write!(body, "        case {k}u: {{ // {pc:x}\n{text}        }} break;\n");
     }
@@ -294,7 +346,7 @@ mod tests {
         // branches by offset: the loop's back edge, the skips over two blocks and over one
         assert!(t.hlsl.contains("xcl_nb = xcl_b + 0u;") && t.hlsl.contains("xcl_nb = xcl_b + 2u;") && t.hlsl.contains("xcl_nb = xcl_b + 1u;"), "{}", t.hlsl);
         // every instruction a block of its own: the same instruction texts are shared too
-        let each = compact(&code, &Options::default(), 0).unwrap();
+        let each = compact(&code, &Options::default(), 0, MAX_TABLE_WORDS).unwrap();
         assert!(each.blocks < each.instructions && each.blocks > t.blocks, "{}", each.hlsl);
         // no branches: the straight-line form of `translate`
         let line = prog(&[("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 128)])]);
@@ -353,7 +405,7 @@ mod tests {
         let want = run(super::super::translate(&code, &opt).unwrap());
         assert_eq!((want.sgpr[0], want.vgpr[5][3], want.vgpr[40][3], want.vgpr[25][3]), (55, 80, 1655, 0));
         for heavy in [HEAVY, 0] {
-            let got = run(compact(&code, &opt, heavy).unwrap());
+            let got = run(compact(&code, &opt, heavy, MAX_TABLE_WORDS).unwrap());
             assert_eq!((got.sgpr, got.vgpr, got.scc), (want.sgpr.clone(), want.vgpr.clone(), want.scc), "heavy {heavy}");
         }
     }

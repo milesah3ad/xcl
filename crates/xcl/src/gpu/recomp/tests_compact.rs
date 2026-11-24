@@ -102,12 +102,14 @@ fn bytes(r: &KernelResult) -> Vec<u8> {
 /// the split form's upper-half SGPRs) followed by the memory afterwards, as bytes, of each.
 fn both_backends(code: &[u8], opt: &Options, inputs: &Inputs) -> (Vec<u8>, Vec<u8>) {
     let (normal, compact) = both_translations(code, opt);
-    let run = |t: &Translation, backend: &str| {
-        let dxil = compiled(t, backend);
-        let r = runner::run_with_statics(&dxil, &inputs.state, &inputs.mem, &[], &[], &t.static_samplers).unwrap_or_else(|e| panic!("{backend}: run: {e}"));
-        bytes(&r)
-    };
-    (run(&normal, "translate"), run(&compact, "translate_compact"))
+    (ran(&normal, "translate", inputs), ran(&compact, "translate_compact", inputs))
+}
+
+/// `t` compiled and run on `inputs`: its result (`bytes` layout).
+fn ran(t: &Translation, backend: &str, inputs: &Inputs) -> Vec<u8> {
+    let dxil = compiled(t, backend);
+    let r = runner::run_with_statics(&dxil, &inputs.state, &inputs.mem, &[], &[], &t.static_samplers).unwrap_or_else(|e| panic!("{backend}: run: {e}"));
+    bytes(&r)
 }
 
 /// Name of result dword `i` (`bytes` layout).
@@ -176,9 +178,15 @@ impl Dispatch {
             s[..s.find(end).unwrap()].to_string()
         };
         let n: usize = after("        if (xcl_nb >= ", "u) break;").parse().unwrap();
-        // switch ((XCL_BT[xcl_b / {per}u] >> (xcl_b % {per}u * {bits}u)) & {mask}u)
-        let per: usize = after("switch ((XCL_BT[xcl_b / ", "u]").parse().unwrap();
-        let bits: u32 = after(&format!("(xcl_b % {per}u * "), "u))").parse().unwrap();
+        // switch ((XCL_BT[xcl_b / {per}u] >> (xcl_b % {per}u * {bits}u)) & {mask}u), or packed
+        // across words: uint xcl_p = xcl_b * {bits}u; switch (((XCL_BT[xcl_p >> 5u] >> …
+        let dense = h.contains("        uint xcl_p = xcl_b * ");
+        let (per, bits): (usize, u32) = if dense {
+            (0, after("        uint xcl_p = xcl_b * ", "u;").parse().unwrap())
+        } else {
+            let per = after("switch ((XCL_BT[xcl_b / ", "u]").parse().unwrap();
+            (per, after(&format!("(xcl_b % {per}u * "), "u))").parse().unwrap())
+        };
         let table = after("static const uint XCL_BT[", "};");
         let words: Vec<u32> = table[table.find('{').unwrap() + 1..]
             .split(',')
@@ -186,10 +194,22 @@ impl Dispatch {
             .filter(|w| !w.is_empty())
             .map(|w| u32::from_str_radix(w.trim_start_matches("0x").trim_end_matches('u'), 16).unwrap())
             .collect();
-        let class: Vec<usize> = (0..n).map(|b| ((words[b / per] >> (b % per) as u32 * bits) & ((1u32 << bits) - 1)) as usize).collect();
+        let mask = (1u64 << bits) - 1;
+        let class: Vec<usize> = (0..n)
+            .map(|b| {
+                let v = if dense {
+                    let (w, s) = (b * bits as usize / 32, b * bits as usize % 32);
+                    (words[w] as u64 | (words[w + 1] as u64) << 32) >> s
+                } else {
+                    (words[b / per] >> (b % per) as u32 * bits) as u64
+                };
+                (v & mask) as usize
+            })
+            .collect();
         let mut cases: Vec<(u64, String)> = Vec::new();
         let mut open = false;
-        for l in h[h.find("switch ((XCL_BT[").unwrap()..].lines().skip(1) {
+        let switch = h.find(if dense { "switch (((XCL_BT[" } else { "switch ((XCL_BT[" }).unwrap();
+        for l in h[switch..].lines().skip(1) {
             if let Some(rest) = l.strip_prefix("        case ") {
                 let (k, pc) = rest.split_once("u: { // ").unwrap_or_else(|| panic!("case line {l:?}"));
                 assert_eq!(k.parse::<usize>().unwrap(), cases.len(), "cases in order");
@@ -460,6 +480,32 @@ fn repeated_blocks() -> Vec<u8> {
 fn repeated_shape(d: &Dispatch, _: &Options) {
     assert!(d.cases.len() < d.blocks(), "{} cases, {} blocks", d.cases.len(), d.blocks());
     assert!((0..d.cases.len()).any(|c| d.uses(c) >= 3), "table {:?}", d.class);
+}
+
+/// The same block (`X`: VALU + scalar work ending in `s_cbranch_scc1`) twice, branching
+/// forward over a block from the first and back to the first from the second: one case with
+/// two targets. s10 runs 2, 5, 8, 11, 14, so both branches are taken and both fall through.
+fn shared_targets() -> Vec<u8> {
+    fn x<'a>(a: &'a mut Asm, to: &'static str) -> &'a mut Asm {
+        a.i("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", V), ("VSRC1", 2)], None)
+            .i("V_MUL_LO_U32", "ENC_VOP3", &[("VDST", 3), ("SRC0", V + 2), ("SRC1", V + 3)], None)
+            .i("S_ADD_U32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 131)], None)
+            .i("S_CMP_LT_U32", "ENC_SOPC", &[("SSRC0", 10), ("SSRC1", 139)], None)
+            .br("S_CBRANCH_SCC1", to)
+    }
+    let mut a = Asm::default();
+    a.i("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 130)], None).label("top");
+    x(&mut a, "mid").i("V_OR_B32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 129), ("VSRC1", 4)], None).label("mid");
+    x(&mut a, "top").i("V_OR_B32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 130), ("VSRC1", 4)], None);
+    a.end()
+}
+
+/// `shared_targets` in the compact form: the two copies of `X` are one case, which picks the
+/// second one's target by its block index.
+fn shared_targets_shape(d: &Dispatch, _: &Options) {
+    let c = d.only("xcl_t = select(xcl_b == ");
+    assert_eq!(d.uses(c), 2, "table {:?}", d.class);
+    assert_eq!(d.cases[c].1.matches("select(xcl_b == ").count(), 1, "{}", d.cases[c].1);
 }
 
 /// Far jumps (s_getpc_b64, add / sub of a literal, s_setpc_b64): a backward one closes a loop,
@@ -778,6 +824,7 @@ fn compact_and_normal_forms_compile() {
     let programs = [
         ("execz nest", execz_nest()),
         ("repeated blocks", repeated_blocks()),
+        ("shared targets", shared_targets()),
         ("far jumps", far_jumps()),
         ("exchange repeated", exchange_repeated()),
         ("buffer_load_format_x repeated", load_x_repeated()),
@@ -815,6 +862,47 @@ fn gpu_compact_backward_loops() {
     let inputs = Inputs::lanes(Vec::new()).vgpr(6, |l| hash(l, 6));
     assert_shape("backward loops", &backward_loops(), true, dispatched);
     assert_same("backward loops", &backward_loops(), &inputs, true);
+}
+
+#[test]
+fn gpu_compact_shared_targets() {
+    if !gpu_ready() {
+        return;
+    }
+    let inputs = Inputs::lanes(Vec::new()).vgpr(2, |l| hash(l, 2)).vgpr(3, |l| hash(l, 3) | 1);
+    assert_shape("shared targets", &shared_targets(), true, shared_targets_shape);
+    assert_same("shared targets", &shared_targets(), &inputs, true);
+}
+
+/// A table packed across words (`compact::compact` past `dense_above`) gives every block the
+/// case the usual packing gives it, and the program runs as `translate`'s does. Every
+/// instruction is a block of its own (`heavy` 0), so some cases straddle words.
+#[test]
+fn gpu_compact_dense_table() {
+    if !gpu_ready() {
+        return;
+    }
+    let inputs = Inputs::lanes(Vec::new()).vgpr(1, |l| hash(l, 1)).vgpr(2, |l| hash(l, 2)).vgpr(3, |l| hash(l, 3) | 1).vgpr(6, |l| hash(l, 6));
+    let mut straddled = 0;
+    let programs = [("shared targets", shared_targets()), ("repeated blocks", repeated_blocks()), ("execz nest", execz_nest()), ("backward loops", backward_loops())];
+    for (what, code) in programs {
+        for (form, opt) in forms(true) {
+            let packed = compact::compact(&code, &opt, 0, usize::MAX).unwrap_or_else(|e| panic!("{what} ({form}): {e}"));
+            let dense = compact::compact(&code, &opt, 0, 0).unwrap_or_else(|e| panic!("{what} ({form}): {e}"));
+            let (p, d) = (Dispatch::of(&packed), Dispatch::of(&dense));
+            assert!(!packed.hlsl.contains("xcl_p") && dense.hlsl.contains("uint xcl_p = xcl_b * "), "{what} ({form})");
+            let bits = (usize::BITS - (d.cases.len() - 1).leading_zeros()) as usize;
+            straddled += (0..d.blocks()).filter(|b| b * bits % 32 + bits > 32).count();
+            assert_eq!((&p.class, &p.cases), (&d.class, &d.cases), "{what} ({form})");
+            let want = ran(&translate(&code, &opt).unwrap(), "translate", &inputs);
+            let got = ran(&dense, "compact, packed across words", &inputs);
+            let diff = differences(&want, &got, slot);
+            assert!(diff.is_empty(), "{what} ({form}): translate / packed table differ:\n{}", diff.join("\n"));
+            println!("{what} ({form}): {} blocks, {} cases, {} result bytes identical", d.blocks(), d.cases.len(), got.len());
+        }
+    }
+    assert!(straddled > 0, "no case straddles a word");
+    println!("{straddled} blocks' cases straddle a word");
 }
 
 #[test]
